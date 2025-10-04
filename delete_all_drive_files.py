@@ -3,7 +3,7 @@ from pydrive.auth import GoogleAuth
 from pydrive.drive import GoogleDrive
 
 # ---------- Config ----------
-CLIENT_SECRET_PATH = "/Users/nirbhay/shopify/client_secret_942057786652-9q64bdptkc29c67fnndrnndj596ibtr3.apps.googleusercontent.com.json"
+CLIENT_SECRET_PATH = ""
 BATCH_SIZE = 100  # Number of files to fetch per API call
 # ----------------------------
 
