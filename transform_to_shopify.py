@@ -1,0 +1,429 @@
+import pandas as pd
+import numpy as np
+import os
+
+# ---------- Config ----------
+INPUT_CSV = "goat_variants_with_drive_urls.csv"
+OUTPUT_CSV_WOMEN = "shopify_import_women.csv"
+OUTPUT_CSV_MEN = "shopify_import_men.csv"
+# ----------------------------
+
+print("🔄 Transforming data for Shopify import...")
+print("=" * 70)
+
+# Check if file exists
+if not os.path.exists(INPUT_CSV):
+    raise SystemExit(f"❌ Error: {INPUT_CSV} not found!")
+
+# Load CSV
+print(f"📁 Loading {INPUT_CSV}...")
+df = pd.read_csv(INPUT_CSV, dtype=str, encoding='utf-8-sig').fillna("")
+print(f"   ✅ Loaded {len(df)} rows")
+
+# Split data by gender
+print(f"\n🔀 Splitting data by gender...")
+df_women = df[df['Gender'].str.lower().str.contains('women', na=False)]
+df_men = df[df['Gender'].str.lower().str.contains('men', na=False) & ~df['Gender'].str.lower().str.contains('women', na=False)]
+
+print(f"   👩 Women rows: {len(df_women)}")
+print(f"   👨 Men rows: {len(df_men)}")
+
+def transform_dataframe(df_input, gender_label):
+    """Transform input dataframe to Shopify format"""
+    
+    if len(df_input) == 0:
+        print(f"   ⚠️  No {gender_label} rows to process")
+        return None
+    
+    print(f"\n🔧 Processing {gender_label} transformations...")
+    
+    # Create new dataframe for output
+    df_output = pd.DataFrame()
+
+    # ---------- Handle (from Slug) ----------
+    if 'Slug' in df_input.columns:
+        df_output['Handle'] = df_input['Slug'].str.strip()
+    elif 'Product Name' in df_input.columns:
+        df_output['Handle'] = df_input['Product Name'].str.lower().str.replace(' ', '-').str.replace('[^a-z0-9-]', '', regex=True)
+    else:
+        df_output['Handle'] = df_input['Product ID'].apply(lambda x: f"product-{x}")
+
+    # ---------- Title (Product Name + Brand) ----------
+    def create_title(row):
+        product_name = str(row.get('Product Name', '')).strip()
+        brand = str(row.get('brandName', row.get('Brand', ''))).strip()
+        if product_name and brand:
+            return f"{product_name} {brand}"
+        elif product_name:
+            return product_name
+        return ""
+    
+    df_output['Title'] = df_input.apply(create_title, axis=1)
+
+    # ---------- Body (HTML) (from story_html + custom text) ----------
+    def create_body_html(row):
+        story_html = str(row.get('story_html', '')).strip()
+        product_name = str(row.get('Product Name', '')).strip()
+        color = str(row.get('color', '')).strip()
+        
+        # Custom footer text
+        footer = f"""<br>Elevate your sneaker game with the latest ON Running Products exclusively only on Hustle Culture.</br>
+SKU : {product_name if product_name else 'N/A'}
+Colorway : {color if color else 'N/A'}
+<br>NOTE - The pair ships in 22-28 working days.</p>"""
+        
+        if story_html:
+            return f"{story_html}\n{footer}"
+        else:
+            return footer
+    
+    df_output['Body (HTML)'] = df_input.apply(create_body_html, axis=1)
+
+    # ---------- Vendor (from brandName) ----------
+    df_output['Vendor'] = df_input['brandName'] if 'brandName' in df_input.columns else df_input.get('Brand', "")
+
+    # ---------- Type (from Product Type or Category) ----------
+    df_output['Type'] = df_input.get('Product Type', df_input.get('Category', ""))
+
+    # ---------- Tags (Only 3 tags total) ----------
+    def build_tags(row):
+        tags = ["All Salomon", "Mindcase Salomon"]
+        
+        # Add ONE additional tag (priority: Silhouette > Gender > Color > Category)
+        additional_tag = None
+        
+        silhouette = str(row.get('Silhouette', '')).strip()
+        if silhouette and silhouette != 'N/A':
+            additional_tag = silhouette
+        
+        if not additional_tag:
+            gender = str(row.get('Gender', '')).strip()
+            if gender and gender != 'N/A':
+                additional_tag = gender
+        
+        if not additional_tag:
+            color = str(row.get('color', '')).strip()
+            if color and color != 'N/A':
+                additional_tag = color
+        
+        if not additional_tag:
+            category = str(row.get('Category', '')).strip()
+            if category and category != 'N/A':
+                additional_tag = category
+        
+        if additional_tag:
+            tags.append(additional_tag)
+        
+        return ", ".join(tags)
+
+    df_output['Tags'] = df_input.apply(build_tags, axis=1)
+
+    # ---------- Status ----------
+    df_output['Status'] = "Active"
+
+    # ---------- Published ----------
+    df_output['Published'] = "TRUE"
+
+    # ---------- Published Scope ----------
+    df_output['Published Scope'] = "web"
+
+    # ---------- Template Suffix ----------
+    df_output['Template Suffix'] = ""
+
+    # ---------- Gift Card ----------
+    df_output['Gift Card'] = "FALSE"
+
+    # ---------- Total Inventory Qty (will be calculated later) ----------
+    # Placeholder - will update after calculating variant counts
+    df_output['Total Inventory Qty'] = ""
+
+    # ---------- Row # ----------
+    # Counter increases per handle, resets to 1 when handle changes
+    df_output['Row #'] = df_output.groupby('Handle').cumcount() + 1
+
+    # ---------- Top Row ----------
+    # TRUE only for first unique value, blank for repeating
+    df_output['Top Row'] = ""
+    if len(df_output) > 0:
+        handle_changed = df_output['Handle'].ne(df_output['Handle'].shift()).fillna(True)
+        df_output.loc[handle_changed, 'Top Row'] = "TRUE"
+
+    # ---------- Category: Name ----------
+    df_output['Category: Name'] = "Shoes"
+
+    # ---------- Image Type ----------
+    df_output['Image Type'] = "Image"
+
+    # ---------- Image Src (only for first row per product) ----------
+    def get_image_src(row, is_top_row):
+        if is_top_row == "TRUE":
+            return row.get('drive_url', row.get('Picture URL', ''))
+        return ""
+    
+    df_output['Image Src'] = df_input.apply(
+        lambda row: get_image_src(row, df_output.loc[row.name, 'Top Row']), 
+        axis=1
+    )
+
+    # ---------- Image Command ----------
+    df_output['Image Command'] = ""
+
+    # ---------- Image Position (only 1 for first row, blank for rest) ----------
+    df_output['Image Position'] = df_output['Top Row'].apply(lambda x: "1" if x == "TRUE" else "")
+
+    # ---------- Image Width (only for first row per product) ----------
+    df_output['Image Width'] = df_input.get('Image Width', "")
+    df_output.loc[df_output['Top Row'] != "TRUE", 'Image Width'] = ""
+
+    # ---------- Image Height (only for first row per product) ----------
+    df_output['Image Height'] = df_input.get('Image Height', "")
+    df_output.loc[df_output['Top Row'] != "TRUE", 'Image Height'] = ""
+
+    # ---------- Image Alt Text (Title + Brand) ----------
+    def create_alt_text(row):
+        title = str(df_output.loc[row.name, 'Title']).strip()
+        brand = str(row.get('brandName', row.get('Brand', ''))).strip()
+        if title and brand:
+            return f"{title} {brand}"
+        return title
+    
+    df_output['Image Alt Text'] = df_input.apply(create_alt_text, axis=1)
+
+    # ---------- Option1 Name ----------
+    df_output['Option1 Name'] = "Size"
+
+    # ---------- Option1 Value (UK Size) ----------
+    def calculate_option1_value(row):
+        try:
+            size_value = None
+            for col in ['Size Value (Numeric)', 'US Size (Size-1)', 'Size (Original)']:
+                if col in row and row[col]:
+                    try:
+                        size_value = float(row[col])
+                        break
+                    except:
+                        continue
+
+            if size_value is None:
+                return ""
+
+            gender = str(row.get('Gender', '')).lower().strip()
+
+            if 'men' in gender and 'women' not in gender:
+                adjusted = size_value - 0.5
+            elif 'women' in gender:
+                adjusted = size_value - 1.5
+            else:
+                adjusted = size_value
+
+            if adjusted == int(adjusted):
+                return f"UK {int(adjusted)}"
+            else:
+                return f"UK {adjusted}"
+        except:
+            return ""
+
+    df_output['Option1 Value'] = df_input.apply(calculate_option1_value, axis=1)
+
+    # ---------- Variant Price ----------
+    # For rows with no price (out of stock), set to 55999
+    def calculate_variant_price(row):
+        try:
+            variant_price_usd = None
+            
+            if 'Lowest Price (USD)' in row and row['Lowest Price (USD)']:
+                price_str = str(row['Lowest Price (USD)']).replace('$', '').replace(',', '').strip()
+                if price_str and price_str != 'N/A':
+                    variant_price_usd = float(price_str)
+            
+            if variant_price_usd is None and 'Lowest Price (Cents)' in row and row['Lowest Price (Cents)']:
+                cents_str = str(row['Lowest Price (Cents)']).strip()
+                if cents_str and cents_str != 'N/A':
+                    variant_price_usd = float(cents_str) / 100
+
+            # If no price (out of stock), use 55999
+            if variant_price_usd is None or variant_price_usd == 0:
+                variant_price_usd = 559.99  # $559.99 USD
+
+            # Apply formula: 1.2 * [(price + 10) * 94 + 2250]
+            calculated = 1.2 * ((variant_price_usd + 10) * 94 + 2250)
+
+            # Round to nearest 500 - 1
+            rounded = round(calculated / 500) * 500 - 1
+
+            return str(int(rounded))
+        except Exception as e:
+            return ""
+
+    df_output['Variant Price'] = df_input.apply(calculate_variant_price, axis=1)
+
+    # ---------- Variant Compare At Price ----------
+    def calculate_compare_at_price(variant_price):
+        try:
+            if not variant_price or variant_price == "":
+                return ""
+            price = float(variant_price)
+            compare_at = 1.4 * price
+            rounded = round(compare_at / 500) * 500 - 1
+            return str(int(rounded))
+        except:
+            return ""
+
+    df_output['Variant Compare At Price'] = df_output['Variant Price'].apply(calculate_compare_at_price)
+
+    # ---------- Variant Inventory Tracker ----------
+    df_output['Variant Inventory Tracker'] = "shopify"
+
+    # ---------- Variant Inventory Policy ----------
+    df_output['Variant Inventory Policy'] = "deny"
+
+    # ---------- Variant Inventory Qty ----------
+    # 0 for out of stock (original price was 0), 50 for in stock
+    def calculate_inventory_qty(row):
+        try:
+            variant_price_usd = None
+            
+            if 'Lowest Price (USD)' in row and row['Lowest Price (USD)']:
+                price_str = str(row['Lowest Price (USD)']).replace('$', '').replace(',', '').strip()
+                if price_str and price_str != 'N/A':
+                    variant_price_usd = float(price_str)
+            
+            if variant_price_usd is None and 'Lowest Price (Cents)' in row and row['Lowest Price (Cents)']:
+                cents_str = str(row['Lowest Price (Cents)']).strip()
+                if cents_str and cents_str != 'N/A':
+                    variant_price_usd = float(cents_str) / 100
+
+            # If original price was 0 or None, set qty to 0
+            if variant_price_usd is None or variant_price_usd == 0:
+                return "0"
+            
+            return "50"
+        except:
+            return "50"
+
+    df_output['Variant Inventory Qty'] = df_input.apply(calculate_inventory_qty, axis=1)
+
+    # ---------- Gender ----------
+    df_output['Gender'] = df_input.get('Gender', "")
+
+    # ---------- Remove Duplicate Sizes ----------
+    print(f"   🔍 Checking for duplicate sizes per product...")
+    initial_count = len(df_output)
+
+    # Group by Handle and Option1 Value (size) to find duplicates
+    duplicates_removed = []
+    df_cleaned = []
+
+    for handle, group in df_output.groupby('Handle', sort=False):
+        for size, size_group in group.groupby('Option1 Value', sort=False):
+            if len(size_group) > 1 and size:  # Duplicates found
+                # Priority 1: Remove rows where Variant Inventory Qty is 0
+                non_zero_qty = size_group[size_group['Variant Inventory Qty'] != '0']
+
+                if len(non_zero_qty) > 0:
+                    # Keep first non-zero qty row
+                    df_cleaned.append(non_zero_qty.iloc[[0]])
+                    duplicates_removed.append(f"   ⚠️  '{size}' for {handle}: removed {len(size_group) - 1} duplicate(s) (kept non-zero qty)")
+                else:
+                    # All are 0, keep first one
+                    df_cleaned.append(size_group.iloc[[0]])
+                    duplicates_removed.append(f"   ⚠️  '{size}' for {handle}: removed {len(size_group) - 1} duplicate(s) (all zero qty, kept first)")
+            else:
+                # No duplicates, keep the row(s)
+                df_cleaned.append(size_group)
+
+    if df_cleaned:
+        df_output = pd.concat(df_cleaned, ignore_index=True)
+
+    if duplicates_removed:
+        print(f"   ❌ Removed {initial_count - len(df_output)} duplicate size row(s):")
+        for msg in duplicates_removed[:10]:  # Show first 10
+            print(msg)
+        if len(duplicates_removed) > 10:
+            print(f"   ... and {len(duplicates_removed) - 10} more")
+    else:
+        print(f"   ✅ No duplicate sizes found")
+
+    # ---------- Recalculate Row # after removing duplicates ----------
+    df_output['Row #'] = df_output.groupby('Handle').cumcount() + 1
+
+    # ---------- Recalculate Top Row after removing duplicates ----------
+    df_output['Top Row'] = ""
+    if len(df_output) > 0:
+        handle_changed = df_output['Handle'].ne(df_output['Handle'].shift()).fillna(True)
+        df_output.loc[handle_changed, 'Top Row'] = "TRUE"
+
+    # ---------- Recalculate Image-related fields for new top rows ----------
+    # Reset image fields for non-top rows
+    df_output.loc[df_output['Top Row'] != "TRUE", 'Image Src'] = ""
+    df_output.loc[df_output['Top Row'] != "TRUE", 'Image Position'] = ""
+    df_output.loc[df_output['Top Row'] != "TRUE", 'Image Width'] = ""
+    df_output.loc[df_output['Top Row'] != "TRUE", 'Image Height'] = ""
+
+    # ---------- Calculate Total Inventory Qty ----------
+    # Sum of all variant inventory quantities per handle
+    handle_variant_counts = df_output.groupby('Handle')['Variant Inventory Qty'].apply(
+        lambda x: sum([int(qty) for qty in x if qty.isdigit()])
+    )
+    df_output['Total Inventory Qty'] = df_output['Handle'].map(handle_variant_counts).astype(str)
+    
+    # Reorder columns
+    column_order = [
+        'Handle', 'Title', 'Body (HTML)', 'Vendor', 'Type', 'Tags', 'Status',
+        'Published', 'Published Scope', 'Template Suffix', 'Gift Card',
+        'Total Inventory Qty', 'Row #', 'Top Row', 'Category: Name',
+        'Image Type', 'Image Src', 'Image Command', 'Image Position',
+        'Image Width', 'Image Height', 'Image Alt Text', 'Option1 Name',
+        'Option1 Value', 'Variant Price', 'Variant Compare At Price',
+        'Variant Inventory Tracker', 'Variant Inventory Policy',
+        'Variant Inventory Qty', 'Gender'
+    ]
+    
+    df_output = df_output[column_order]
+    
+    return df_output
+
+
+# Transform women data
+df_women_output = transform_dataframe(df_women, "Women")
+
+# Transform men data
+df_men_output = transform_dataframe(df_men, "Men")
+
+# Save outputs
+print("\n" + "=" * 70)
+print("💾 Saving output files...")
+print("=" * 70)
+
+if df_women_output is not None and len(df_women_output) > 0:
+    df_women_output.to_csv(OUTPUT_CSV_WOMEN, index=False, encoding='utf-8-sig')
+    print(f"✅ Women: Saved {len(df_women_output)} rows to {OUTPUT_CSV_WOMEN}")
+else:
+    print(f"⚠️  Women: No data to save")
+
+if df_men_output is not None and len(df_men_output) > 0:
+    df_men_output.to_csv(OUTPUT_CSV_MEN, index=False, encoding='utf-8-sig')
+    print(f"✅ Men: Saved {len(df_men_output)} rows to {OUTPUT_CSV_MEN}")
+else:
+    print(f"⚠️  Men: No data to save")
+
+print("\n" + "=" * 70)
+print("🎉 Done! Files created:")
+print("=" * 70)
+
+# Show statistics for both
+if df_women_output is not None and len(df_women_output) > 0:
+    print(f"\n👩 WOMEN'S PRODUCTS ({OUTPUT_CSV_WOMEN}):")
+    print(f"   Total rows: {len(df_women_output)}")
+    print(f"   Unique products: {df_women_output['Handle'].nunique()}")
+    print(f"   Rows with images: {len(df_women_output[df_women_output['Image Src'] != ''])}")
+    print(f"   Rows with prices: {len(df_women_output[df_women_output['Variant Price'] != ''])}")
+
+if df_men_output is not None and len(df_men_output) > 0:
+    print(f"\n👨 MEN'S PRODUCTS ({OUTPUT_CSV_MEN}):")
+    print(f"   Total rows: {len(df_men_output)}")
+    print(f"   Unique products: {df_men_output['Handle'].nunique()}")
+    print(f"   Rows with images: {len(df_men_output[df_men_output['Image Src'] != ''])}")
+    print(f"   Rows with prices: {len(df_men_output[df_men_output['Variant Price'] != ''])}")
+
+print("\n" + "=" * 70)
